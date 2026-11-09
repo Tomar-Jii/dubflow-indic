@@ -36,7 +36,7 @@ def process_dubflow(youtube_url, upload_audio, start_time, end_time, voice_choic
 
     active_gemini_key = gemini_key.strip() if gemini_key else DEFAULT_GEMINI_KEY
     active_groq_key = groq_key.strip() if groq_key else DEFAULT_GROQ_KEY
-    chosen_voice = VOICE_MAP.get(voice_choice, "hi-IN-MadhurNeural")
+    chosen_voice = VOICE_MAP.get(voice_choice, "hi-IN-SwaraNeural")
 
     try:
         # Step 1: Ingestion
@@ -79,30 +79,28 @@ def process_dubflow(youtube_url, upload_audio, start_time, end_time, voice_choic
         if "segments" not in groq_data:
             return None, None, f"❌ Groq API Error: {str(groq_data.get('error', groq_data))}"
 
-        transcript = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"].strip()} for s in groq_data["segments"]]
-        if not transcript:
-            return None, None, "❌ Error: No speech detected in source audio."
+        transcript_text = " ".join([s["text"].strip() for s in groq_data["segments"]])
+        print(f"📝 Original English Text: {transcript_text}")
 
-        # Step 3: Gemini Flash Translation
+        # Step 3: Direct Clean Gemini Flash Translation (No Complex JSON Breakage)
         print("🤖 [3/5] Gemini Translation...")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={active_gemini_key}"
         prompt = f"""
-        Translate into natural, conversational, inspirational Hindi in Devanagari script.
-        Keep sentence length budgeted to match speaking duration ({src_duration:.1f}s).
-        Return STRICTLY valid JSON: [{{"start": float, "end": float, "english": "...", "hindi": "...", "tone": "..."}}]
-        Transcript: {json.dumps(transcript)}
+        Translate this English dialogue into natural, conversational, expressive Hindi in Devanagari script.
+        Keep the meaning, emotion, and colloquial feel intact.
+        Ensure it can be spoken in roughly {src_duration:.1f} seconds.
+        Return ONLY the translated Hindi text, nothing else.
+
+        English: {transcript_text}
         """
         
-        full_hindi = ""
-        try:
-            res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 450}}, timeout=15)
-            clean_json = res.json()["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
-            dubbed_data = json.loads(clean_json)
-            full_hindi = " ".join([d["hindi"] for d in dubbed_data])
-        except Exception as e:
-            print("Gemini fallback triggered:", e)
-            # Direct text fallback if JSON parsing stalls
-            full_hindi = "आज आपके बीच होना मेरे लिए बड़े सम्मान की बात है।"
+        res = requests.post(
+            url, 
+            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 300}}, 
+            timeout=15
+        )
+        full_hindi = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        print(f"✅ Translated Hindi: {full_hindi}")
 
         # Step 4: Edge-TTS Native Hindi Speech
         print("🗣️ [4/5] Edge-TTS Synthesis...")
@@ -118,7 +116,7 @@ def process_dubflow(youtube_url, upload_audio, start_time, end_time, voice_choic
         subprocess.run(f'ffmpeg -y -i synth_16k.wav -filter:a "atempo={speed_ratio:.4f},silenceremove=stop_periods=-1:stop_duration=0.18:stop_threshold=-35dB" "{out_master}"', shell=True)
 
         total_time = time.time() - t_start
-        status_msg = f"⚡ COMPLETED IN {total_time:.1f}s!\n\nHindi Script:\n{full_hindi}"
+        status_msg = f"⚡ COMPLETED IN {total_time:.1f}s!\n\nOriginal English:\n{transcript_text}\n\nHindi Dub:\n{full_hindi}"
         return "input_clean.wav", out_master, status_msg
 
     except Exception as e:
@@ -136,7 +134,11 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="orange", secondary_hue="slate")
             with gr.Row():
                 t_start = gr.Textbox(label="Start Time", value="00:00:00")
                 t_end = gr.Textbox(label="End Time", value="00:00:30")
-            voice_select = gr.Dropdown(label="Voice Character", choices=["Deep Professional Male (Madhur)", "Expressive Emotional Female (Swara)"], value="Deep Professional Male (Madhur)")
+            voice_select = gr.Dropdown(
+                label="Voice Character", 
+                choices=["Expressive Emotional Female (Swara)", "Deep Professional Male (Madhur)"], 
+                value="Expressive Emotional Female (Swara)"
+            )
             with gr.Accordion("API Keys (Configured)", open=False):
                 key_gemini = gr.Textbox(label="Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
                 key_groq = gr.Textbox(label="Groq API Key", value=DEFAULT_GROQ_KEY, type="password")
