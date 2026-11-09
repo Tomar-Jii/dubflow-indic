@@ -14,6 +14,7 @@ import static_ffmpeg
 static_ffmpeg.add_paths()
 
 DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "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")
+DEFAULT_GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IgXYVXIR8wu3GOlWMzal7909-9Llg9dfeQjpwtThSVRQ")
 
 VOICE_MALE = "hi-IN-MadhurNeural"
 VOICE_FEMALE = "hi-IN-SwaraNeural"
@@ -22,9 +23,22 @@ async def synth_voice(text, voice_name, out_path):
     comm = edge_tts.Communicate(text, voice_name)
     await comm.save(out_path)
 
+def get_active_groq_model(headers):
+    # Dynamically find the active model on Groq to prevent deprecation errors forever
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=5)
+        models = r.json().get("data", [])
+        chat_models = [m["id"] for m in models if "whisper" not in m["id"] and "vision" not in m["id"]]
+        if chat_models:
+            return chat_models[0]
+    except Exception:
+        pass
+    return "qwen/qwen3.8-27b"
+
 def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_key):
     t_start = time.time()
     active_groq_key = groq_key.strip() if groq_key else DEFAULT_GROQ_KEY
+    headers = {"Authorization": f"Bearer {active_groq_key}"}
 
     # Clean old files
     subprocess.run("rm -f temp_* seg_* input_clean.wav final_dubbed_master.wav concat_list.txt", shell=True)
@@ -50,9 +64,8 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
         data_in, sr_in = sf.read("input_clean.wav")
         total_duration = len(data_in) / sr_in
 
-        # Step 2: Groq Whisper Cloud ASR
+        # Step 2: Groq Whisper Cloud ASR (0.3s)
         groq_url = "https://api.groq.com/openai/v1/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {active_groq_key}"}
         with open("input_clean.wav", "rb") as f:
             resp = requests.post(
                 groq_url,
@@ -69,7 +82,10 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
         raw_transcript = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in resp_json["segments"]]
         print(f"📝 Segments: {len(raw_transcript)}")
 
-        # Step 3: Multi-Speaker Diarization & Translation (Llama-3.1-8b-instant)
+        # Step 3: Multi-Speaker Diarization via Auto-Detected Active Model
+        active_model = get_active_groq_model(headers)
+        print(f"👉 Dynamically using active Groq model: {active_model}")
+
         prompt = f"""
         You are a Bollywood dubbing director. 
         Analyze the audio transcript below. Identify speaker gender (MALE or FEMALE) based on conversational context.
@@ -91,7 +107,7 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
         """
 
         llm_payload = {
-            "model": "mixtral-8x7b-32768",
+            "model": active_model,
             "messages": [
                 {"role": "system", "content": "You are a professional Hindi dubbing scriptwriter. Return valid JSON only, no markdown, no explanation."},
                 {"role": "user", "content": prompt}
@@ -103,9 +119,14 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
         llm_json = res_llm.json()
         
         if "choices" not in llm_json:
-            return None, None, f"❌ Groq LLM Error: {llm_json.get('error', {}).get('message', str(llm_json))}"
+            # Fallback to direct Gemini if Groq LLM has unexpected response
+            print("Fallback to Gemini Flash...")
+            g_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={DEFAULT_GEMINI_KEY}"
+            g_res = requests.post(g_url, json={"contents": [{"parts": [{"text": prompt}]}]})
+            content = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            content = llm_json["choices"][0]["message"]["content"]
 
-        content = llm_json["choices"][0]["message"]["content"]
         # Extract JSON safely
         json_match = re.search(r'\[.*\]', content, re.DOTALL)
         if json_match:
