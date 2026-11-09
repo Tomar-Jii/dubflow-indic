@@ -91,7 +91,7 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
         """
 
         llm_payload = {
-            "model": "llama-3.1-8b-instant",
+            "model": "llama3-8b-8192",
             "messages": [
                 {"role": "system", "content": "You are a professional Hindi dubbing scriptwriter. Return valid JSON only, no markdown, no explanation."},
                 {"role": "user", "content": prompt}
