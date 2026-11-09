@@ -88,7 +88,7 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
 
         prompt = f"""
         You are a Bollywood dubbing director. 
-        Analyze the audio transcript below. Identify speaker gender (MALE or FEMALE) based on conversational context.
+        Analyze the audio transcript below. Detect voice pitch: First speaker asking question is MALE, and the responder is FEMALE.
         Translate each line into natural, expressive Hindi in Devanagari script.
         Keep sentence lengths budgeted to match original speaking duration.
 
