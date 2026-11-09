@@ -4,6 +4,7 @@ import time
 import asyncio
 import subprocess
 import traceback
+import re
 import requests
 import soundfile as sf
 import edge_tts
@@ -14,7 +15,6 @@ static_ffmpeg.add_paths()
 
 DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "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")
 
-# Character Mapping
 VOICE_MALE = "hi-IN-MadhurNeural"
 VOICE_FEMALE = "hi-IN-SwaraNeural"
 
@@ -26,8 +26,8 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
     t_start = time.time()
     active_groq_key = groq_key.strip() if groq_key else DEFAULT_GROQ_KEY
 
-    # Clean previous temp files
-    subprocess.run("rm -f temp_* seg_* input_clean.wav final_dubbed_master.wav", shell=True)
+    # Clean old files
+    subprocess.run("rm -f temp_* seg_* input_clean.wav final_dubbed_master.wav concat_list.txt", shell=True)
 
     try:
         # Step 1: Ingest Audio
@@ -44,10 +44,13 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
                 return None, None, "❌ YouTube rate-limited. Upload audio directly!"
             subprocess.run(f'ffmpeg -y -i temp_dl.wav -ss {start_time} -to {end_time} -ar 16000 -ac 1 -c:a pcm_s16le input_clean.wav', shell=True)
 
+        if not os.path.exists("input_clean.wav"):
+            return None, None, "❌ Audio processing failed."
+
         data_in, sr_in = sf.read("input_clean.wav")
         total_duration = len(data_in) / sr_in
 
-        # Step 2: Groq Cloud Whisper with Segment Timestamps
+        # Step 2: Groq Whisper Cloud ASR
         groq_url = "https://api.groq.com/openai/v1/audio/transcriptions"
         headers = {"Authorization": f"Bearer {active_groq_key}"}
         with open("input_clean.wav", "rb") as f:
@@ -59,26 +62,26 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
                 timeout=25
             )
         
-        segments = resp.json().get("segments", [])
-        if not segments:
-            return None, None, "❌ No speech segments detected."
+        resp_json = resp.json()
+        if "segments" not in resp_json:
+            return None, None, f"❌ Whisper Error: {resp_json.get('error', {}).get('message', str(resp_json))}"
 
-        raw_transcript = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in segments]
+        raw_transcript = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in resp_json["segments"]]
+        print(f"📝 Segments: {len(raw_transcript)}")
 
-        # Step 3: LLM Multi-Speaker Diarization & Translation (Groq Llama-3)
+        # Step 3: Multi-Speaker Diarization & Translation (Llama-3.1-8b-instant)
         prompt = f"""
-        Analyze this transcript with timestamps. 
-        Identify speaker turns and gender (MALE or FEMALE) based on context and dialogue flow.
-        Translate each turn into natural, expressive Hindi in Devanagari script.
-        Keep sentence lengths budgeted to match their original durations.
+        You are a Bollywood dubbing director. 
+        Analyze the audio transcript below. Identify speaker gender (MALE or FEMALE) based on conversational context.
+        Translate each line into natural, expressive Hindi in Devanagari script.
+        Keep sentence lengths budgeted to match original speaking duration.
 
-        Return STRICTLY a JSON list with this exact structure:
+        Return strictly valid JSON:
         [
           {{
             "speaker_gender": "MALE" or "FEMALE",
             "start": float,
             "end": float,
-            "original_english": "...",
             "hindi_dub": "..."
           }}
         ]
@@ -88,30 +91,41 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
         """
 
         llm_payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model": "llama-3.1-8b-instant",
             "messages": [
-                {"role": "system", "content": "You are a professional dubbing director. Output valid JSON only, no markdown, no explanation."},
+                {"role": "system", "content": "You are a professional Hindi dubbing scriptwriter. Return valid JSON only, no markdown, no explanation."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"} if False else None
+            "temperature": 0.2
         }
-        res_llm = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=llm_payload, timeout=15)
-        clean_json_str = res_llm.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
-        parsed_script = json.loads(clean_json_str)
-        if isinstance(parsed_script, dict) and "segments" in parsed_script:
-            parsed_script = parsed_script["segments"]
 
-        # Step 4: Multi-Speaker Generation & Timestamp Stitching
+        res_llm = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=llm_payload, timeout=15)
+        llm_json = res_llm.json()
+        
+        if "choices" not in llm_json:
+            return None, None, f"❌ Groq LLM Error: {llm_json.get('error', {}).get('message', str(llm_json))}"
+
+        content = llm_json["choices"][0]["message"]["content"]
+        # Extract JSON safely
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if json_match:
+            parsed_script = json.loads(json_match.group(0))
+        else:
+            parsed_script = json.loads(content.replace("```json", "").replace("```", "").strip())
+
+        # Step 4: Multi-Speaker Synthesis & Alignment
         segment_files = []
         status_log = "🎙️ MULTI-SPEAKER TIMELINE:\n"
 
         for idx, seg in enumerate(parsed_script):
-            gender = seg.get("speaker_gender", "MALE").upper()
+            gender = str(seg.get("speaker_gender", "FEMALE")).upper()
             hindi_text = seg.get("hindi_dub", "").strip()
+            if not hindi_text:
+                continue
+
             target_dur = max(0.5, seg.get("end", 0) - seg.get("start", 0))
+            chosen_voice = VOICE_MALE if "MALE" in gender else VOICE_FEMALE
             
-            chosen_voice = VOICE_MALE if gender == "MALE" else VOICE_FEMALE
             raw_seg_mp3 = f"seg_raw_{idx}.mp3"
             raw_seg_wav = f"seg_raw_{idx}.wav"
             stretched_seg_wav = f"seg_stretched_{idx}.wav"
@@ -120,7 +134,7 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
             asyncio.run(synth_voice(hindi_text, chosen_voice, raw_seg_mp3))
             subprocess.run(f'ffmpeg -y -v quiet -i {raw_seg_mp3} -ar 16000 -ac 1 -c:a pcm_s16le {raw_seg_wav}', shell=True)
 
-            # Measure & Time-stretch to exact segment duration
+            # Stretch/compress to match exact segment timing
             data_s, sr_s = sf.read(raw_seg_wav)
             cur_dur = len(data_s) / sr_s
             speed_ratio = max(0.75, min(1.40, cur_dur / target_dur))
@@ -129,7 +143,7 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
             segment_files.append(stretched_seg_wav)
             status_log += f"[{seg.get('start',0):.1f}s - {seg.get('end',0):.1f}s] {gender} Voice -> {hindi_text}\n"
 
-        # Step 5: Concat all aligned segments into master timeline
+        # Step 5: Concat aligned segments
         concat_list = "concat_list.txt"
         with open(concat_list, "w") as f:
             for sf_path in segment_files:
@@ -144,7 +158,7 @@ def process_multi_speaker(youtube_url, upload_audio, start_time, end_time, groq_
 
     except Exception as e:
         err = traceback.format_exc()
-        print("Error:", err)
+        print("Detailed Error:", err)
         return None, None, f"❌ Pipeline Error: {str(e)}"
 
 # Gradio Interface
